@@ -16,10 +16,22 @@
     codeforces: [
       /^https?:\/\/(www\.)?codeforces\.com\/problemset\/problem\/\d+\/[A-Za-z0-9]+(\?.*)?$/,
       /^https?:\/\/(www\.)?codeforces\.com\/contest\/\d+\/problem\/[A-Za-z0-9]+(\?.*)?$/,
+      /^https?:\/\/(www\.)?codeforces\.com\/problemset\/status(\/.*)?(\?.*)?$/,
+      /^https?:\/\/(www\.)?codeforces\.com\/contest\/\d+\/status(\?.*)?$/,
     ],
     gfg: [
       /^https?:\/\/(www\.)?geeksforgeeks\.org\/problems\/[^/]+\/\d+(\?.*)?$/,
       /^https?:\/\/practice\.geeksforgeeks\.org\/problems\/[^/]+\/\d+(\?.*)?$/,
+    ],
+  };
+
+  /**
+   * URL patterns for pages where submission results appear (Codeforces redirects here).
+   */
+  const SUBMISSION_PAGE_PATTERNS = {
+    codeforces: [
+      /^https?:\/\/(www\.)?codeforces\.com\/problemset\/status(\/.*)?(\?.*)?$/,
+      /^https?:\/\/(www\.)?codeforces\.com\/contest\/\d+\/status(\?.*)?$/,
     ],
   };
 
@@ -29,7 +41,7 @@
    */
   const DOM_MARKERS = {
     leetcode: ['[data-cy="question-title"]', '.question-content', '[data-key="description"]'],
-    codeforces: ['.problem-statement', '.problemindexholder'],
+    codeforces: ['.problem-statement', '.problemindexholder', '#pageContent'],
     gfg: [], // GFG DOM structure varies; URL pattern is primary
   };
 
@@ -59,24 +71,28 @@
   }
 
   /**
-   * Detects the coding platform and whether the current page is a problem page.
-   * Uses URL patterns and DOM markers for detection.
+   * Detects the coding platform and whether the current page is a problem page
+   * or a page where submission results appear.
    *
-   * @returns {{ platform: "leetcode" | "codeforces" | "gfg" | null, problemPage: boolean }}
+   * @returns {{ platform: "leetcode" | "codeforces" | "gfg" | null, problemPage: boolean, submissionPage: boolean }}
    */
   function detectPlatform() {
     const url = window.location.href;
-    const result = { platform: null, problemPage: false };
+    const result = { platform: null, problemPage: false, submissionPage: false };
 
     for (const [platform, patterns] of Object.entries(URL_PATTERNS)) {
       if (!urlMatches(url, patterns)) continue;
 
       const markers = DOM_MARKERS[platform];
+      const submissionPatterns = SUBMISSION_PAGE_PATTERNS[platform];
       const hasDomMarker =
         !markers || markers.length === 0 ? true : domMatches(markers);
+      const isSubmissionPage =
+        submissionPatterns?.some((p) => p.test(url)) ?? false;
 
       result.platform = platform;
       result.problemPage = hasDomMarker;
+      result.submissionPage = isSubmissionPage || hasDomMarker;
       break;
     }
 
@@ -199,6 +215,105 @@
     }
   }
 
+  /**
+   * Platform-specific success detection. Returns true if the node tree contains
+   * a successful submission indicator.
+   */
+  const SUCCESS_DETECTORS = {
+    leetcode(node) {
+      const el = node.nodeType === 1 ? node : node.parentElement;
+      if (!el) return false;
+      const fullText = (el.textContent ?? '');
+      if (/\d[\d,]*\s*Accepted\s*\/\s*[\d.]/.test(fullText)) return false;
+      const resultEl = el.closest?.('[data-e2e-locator="console-result"], [class*="result-success"], [class*="submission-result"]');
+      if (resultEl?.textContent?.includes('Accepted')) return true;
+      return (el.textContent?.trim() ?? '') === 'Accepted';
+    },
+    codeforces(node) {
+      const el = node.nodeType === 1 ? node : node.parentElement;
+      if (!el) return false;
+      const verdictEl = el.closest?.('.verdict-accepted, .verdict-ok') ?? el.querySelector?.('.verdict-accepted, .verdict-ok');
+      if (verdictEl) return true;
+      const text = (node.textContent ?? '').trim();
+      return text === 'Accepted' || text === 'OK';
+    },
+    gfg(node) {
+      const text = (node.textContent ?? '').trim().toLowerCase();
+      return (
+        text.includes('all test cases passed') ||
+        text.includes('success') ||
+        text === 'correct'
+      );
+    },
+  };
+
+  /**
+   * Checks if any added node indicates a successful solve for the current platform.
+   */
+  function checkNodesForSuccess(nodes, platform) {
+    const detector = SUCCESS_DETECTORS[platform];
+    if (!detector) return false;
+
+    for (const node of nodes) {
+      if (node.nodeType === 1 && detector(node)) return true;
+      if (node.nodeType === 3) {
+        const text = (node.textContent ?? '').trim();
+        const parentText = node.parentElement?.textContent ?? '';
+        if (platform === 'leetcode' && text === 'Accepted' && !/\d[\d,]*\s*Accepted\s*\/\s*[\d.]/.test(parentText)) return true;
+        if (platform === 'codeforces' && (text === 'Accepted' || text === 'OK')) return true;
+        if (platform === 'gfg' && /all test cases passed|success|^correct$/i.test(text)) return true;
+      }
+      if (node.nodeType === 1) {
+        for (const child of node.querySelectorAll?.('*') ?? []) {
+          if (detector(child)) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Emits solve detection. Logs and returns the payload.
+   */
+  function emitSolveDetected() {
+    const payload = { solved: true, timestamp: Date.now() };
+    console.log('Solve detected:', payload);
+    return payload;
+  }
+
+  const SOLVE_COOLDOWN_MS = 3000;
+  let lastSolveEmit = 0;
+
+  const OBSERVER_START_DELAY_MS = 1500;
+
+  /**
+   * Starts observing the DOM for successful submission indicators.
+   */
+  function startSubmissionObserver() {
+    const { platform, submissionPage } = detectPlatform();
+    if (!platform || !submissionPage) return;
+
+    const observer = new MutationObserver((mutations) => {
+      const now = Date.now();
+      if (now - lastSolveEmit < SOLVE_COOLDOWN_MS) return;
+
+      for (const mutation of mutations) {
+        if (mutation.addedNodes.length === 0) continue;
+        const added = Array.from(mutation.addedNodes);
+        if (checkNodesForSuccess(added, platform)) {
+          lastSolveEmit = now;
+          emitSolveDetected();
+          return;
+        }
+      }
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
   const detection = detectPlatform();
   console.log('Content script loaded on', window.location.href);
   console.log('Platform detection:', detection);
@@ -206,5 +321,8 @@
   if (detection.problemPage && detection.platform) {
     const metadata = extractProblemMetadata();
     console.log('Extracted problem metadata:', metadata);
+  }
+  if (detection.submissionPage && detection.platform) {
+    setTimeout(startSubmissionObserver, OBSERVER_START_DELAY_MS);
   }
 })();
