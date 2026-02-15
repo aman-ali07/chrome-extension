@@ -248,6 +248,59 @@
   };
 
   /**
+   * Verdict patterns that indicate any submission (success or fail).
+   */
+  const ATTEMPT_PATTERNS = {
+    leetcode: [
+      'Accepted', 'Wrong Answer', 'Time Limit Exceeded', 'Runtime Error',
+      'Compilation Error', 'Memory Limit Exceeded', 'Output Limit Exceeded',
+    ],
+    codeforces: [
+      'Accepted', 'OK', 'Wrong answer', 'Time limit exceeded', 'Runtime error',
+      'Memory limit exceeded', 'Compilation error', 'Hacked', 'Partial',
+    ],
+    gfg: [
+      'All test cases passed', 'Success', 'Correct', 'Wrong Answer',
+      'Time Limit Exceeded', 'Runtime Error',
+    ],
+  };
+
+  function isAttemptText(text, platform) {
+    const patterns = ATTEMPT_PATTERNS[platform];
+    if (!patterns) return false;
+    const t = (text ?? '').trim();
+    return patterns.some((p) => t === p || t.includes(p));
+  }
+
+  /**
+   * Checks if any added node indicates a submission result (any verdict).
+   */
+  function checkNodesForAttempt(nodes, platform) {
+    for (const node of nodes) {
+      if (node.nodeType !== 1) continue;
+      const el = node;
+      if (platform === 'codeforces') {
+        const verdictEl = el.closest?.('[class*="verdict-"]') ?? el.querySelector?.('[class*="verdict-"]');
+        if (verdictEl) return true;
+      }
+      const text = (el.textContent ?? '').trim();
+      if (isAttemptText(text, platform)) {
+        if (platform === 'leetcode' && /\d[\d,]*\s*Accepted\s*\/\s*[\d.]/.test(text)) continue;
+        return true;
+      }
+      const children = el.querySelectorAll?.('*') ?? [];
+      for (const child of children) {
+        if (platform === 'codeforces' && child.closest?.('[class*="verdict-"]')) return true;
+        if (isAttemptText(child.textContent, platform)) {
+          if (platform === 'leetcode' && /\d[\d,]*\s*Accepted\s*\/\s*[\d.]/.test(child.textContent ?? '')) continue;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
    * Checks if any added node indicates a successful solve for the current platform.
    */
   function checkNodesForSuccess(nodes, platform) {
@@ -272,22 +325,47 @@
     return false;
   }
 
+  const SOLVE_COOLDOWN_MS = 3000;
+  const ATTEMPT_COOLDOWN_MS = 1500;
+  const OBSERVER_START_DELAY_MS = 1500;
+
+  let lastSolveEmit = 0;
+  let lastAttemptEmit = 0;
+  let solveStartTime = null;
+  let submissionAttempts = 0;
+
   /**
-   * Emits solve detection. Logs and returns the payload.
+   * Starts the solve timer. Called once when page loads. Never resets on DOM changes.
+   */
+  function startSolveTimer() {
+    if (solveStartTime === null) {
+      solveStartTime = Date.now();
+    }
+  }
+
+  /**
+   * Returns solve tracking stats.
+   */
+  function getSolveStats() {
+    const elapsed = solveStartTime !== null ? Math.round((Date.now() - solveStartTime) / 1000) : 0;
+    return {
+      timeSpent: elapsed,
+      attempts: submissionAttempts,
+    };
+  }
+
+  /**
+   * Emits solve detection with tracking stats. Logs and returns the payload.
    */
   function emitSolveDetected() {
-    const payload = { solved: true, timestamp: Date.now() };
+    const stats = getSolveStats();
+    const payload = { solved: true, timestamp: Date.now(), ...stats };
     console.log('Solve detected:', payload);
     return payload;
   }
 
-  const SOLVE_COOLDOWN_MS = 3000;
-  let lastSolveEmit = 0;
-
-  const OBSERVER_START_DELAY_MS = 1500;
-
   /**
-   * Starts observing the DOM for successful submission indicators.
+   * Starts observing the DOM for submission indicators and successful solves.
    */
   function startSubmissionObserver() {
     const { platform, submissionPage } = detectPlatform();
@@ -295,16 +373,26 @@
 
     const observer = new MutationObserver((mutations) => {
       const now = Date.now();
+      const addedNodes = [];
+      for (const m of mutations) {
+        if (m.addedNodes.length > 0) addedNodes.push(...Array.from(m.addedNodes));
+      }
+      if (addedNodes.length === 0) return;
+
+      const attemptDetected = checkNodesForAttempt(addedNodes, platform);
+      if (attemptDetected && now - lastAttemptEmit >= ATTEMPT_COOLDOWN_MS) {
+        lastAttemptEmit = now;
+        submissionAttempts += 1;
+      }
+
       if (now - lastSolveEmit < SOLVE_COOLDOWN_MS) return;
 
-      for (const mutation of mutations) {
-        if (mutation.addedNodes.length === 0) continue;
-        const added = Array.from(mutation.addedNodes);
-        if (checkNodesForSuccess(added, platform)) {
-          lastSolveEmit = now;
-          emitSolveDetected();
-          return;
+      if (checkNodesForSuccess(addedNodes, platform)) {
+        if (!attemptDetected || now - lastAttemptEmit >= ATTEMPT_COOLDOWN_MS) {
+          submissionAttempts += 1;
         }
+        lastSolveEmit = now;
+        emitSolveDetected();
       }
     });
 
@@ -323,6 +411,7 @@
     console.log('Extracted problem metadata:', metadata);
   }
   if (detection.submissionPage && detection.platform) {
+    startSolveTimer();
     setTimeout(startSubmissionObserver, OBSERVER_START_DELAY_MS);
   }
 })();
